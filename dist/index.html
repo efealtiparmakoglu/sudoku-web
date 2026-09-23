@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sudoku — offline</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: ui-monospace, monospace;
+    background: #f4f1ea; color: #212121;
+    display: flex; gap: 28px; padding: 24px; margin: 0;
+    align-items: flex-start;
+  }
+  h1 { font-size: 18px; margin: 0 0 10px; }
+  .panel { display: flex; flex-direction: column; gap: 10px; }
+  #board {
+    display: grid;
+    grid-template-columns: repeat(9, 40px) auto auto;
+    width: max-content;
+    background: #212121;
+    border: 3px solid #212121;
+  }
+  .cell {
+    width: 40px; height: 40px;
+    background: #fffdf7; color: #212121;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; cursor: pointer; user-select: none;
+    border-right: 1px solid #cfc8ba; border-bottom: 1px solid #cfc8ba;
+    box-sizing: border-box;
+  }
+  .cell.given { font-weight: bold; background: #f0ebdd; }
+  .cell.selected { outline: 2px solid #2e7d32; outline-offset: -2px; }
+  .cell.wrong { color: #c62828; }
+  .cell.notes {
+    font-size: 11px; color: #777;
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    line-height: 1.2; white-space: pre;
+  }
+  .vgap { width: 3px; }
+  .hgap-full { grid-column: 1 / -1; height: 3px; }
+  button {
+    font: inherit; background: #fffdf7; color: #212121;
+    border: 1px solid #b9b2a3; padding: 6px 12px; cursor: pointer;
+  }
+  button.active { outline: 2px solid #2e7d32; }
+  #status { min-height: 20px; font-size: 14px; }
+  @media print {
+    body { display: block; }
+    .noprint { display: none !important; }
+    #board { border-width: 2px; }
+  }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h1>sudoku <small>(offline)</small></h1>
+    <div class="noprint" style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="new-easy">easy</button>
+      <button id="new-medium">medium</button>
+      <button id="new-hard">hard</button>
+      <button id="hint">hint</button>
+      <button id="note-mode">✏ notes (n)</button>
+      <button id="solve">solve</button>
+      <button id="print">🖨 print/PDF</button>
+    </div>
+    <div class="noprint" style="display:flex; gap:8px;">
+      <input id="grid-line" placeholder="paste 81-char grid" size="28">
+      <button id="load-line">load</button>
+    </div>
+    <div id="board"></div>
+    <div id="status"></div>
+  </div>
+  <div class="panel noprint">
+    <h2>how to play</h2>
+    <ul style="padding-left: 18px; margin: 0; font-size: 13px;">
+      <li>click a cell, type 1–9</li>
+      <li>n toggles pencil notes</li>
+      <li>arrow keys move the selection</li>
+      <li>red digits clash with the solution</li>
+      <li>hint fills the most constrained cell</li>
+      <li>progress autosaves in this browser</li>
+    </ul>
+  </div>
+<script type="module">
+// core.ts
+/* Pure Sudoku core: solver, uniqueness counting, generator with
+ * difficulty targets, hint logic and pencil-note helpers.
+ * No DOM — fully unit-tested in Node. */
+
+                             // 81 values, 0 = empty, row-major
+
+export const ROWS = 9;
+
+export function idx(row        , col        )         {
+  return row * 9 + col;
+}
+
+export function peersOf(cell        )           {
+  const row = Math.floor(cell / 9);
+  const col = cell % 9;
+  const peers = new Set        ();
+  for (let i = 0; i < 9; i++) {
+    peers.add(idx(row, i));
+    peers.add(idx(i, col));
+  }
+  const boxRow = Math.floor(row / 3) * 3;
+  const boxCol = Math.floor(col / 3) * 3;
+  for (let r = boxRow; r < boxRow + 3; r++) {
+    for (let c = boxCol; c < boxCol + 3; c++) {
+      peers.add(idx(r, c));
+    }
+  }
+  peers.delete(cell);
+  return [...peers];
+}
+
+/** Candidates for a cell given the current grid. */
+export function candidates(grid      , cell        )           {
+  const used = new Set        ();
+  for (const p of peersOf(cell)) {
+    if (grid[p] !== 0) used.add(grid[p]          );
+  }
+  const out           = [];
+  for (let digit = 1; digit <= 9; digit++) {
+    if (!used.has(digit)) out.push(digit);
+  }
+  return out;
+}
+
+/** Solve with constraint-friendly backtracking; returns the solution or
+ * null. `randomize` shuffles digit order (used by the generator). */
+export function solve(input      , randomize = false, rng               = Math.random)              {
+  const grid = [...input];
+  const order = randomOrderCells(grid);
+  return backtrack(grid, order, 0, randomize, rng);
+}
+
+function randomOrderCells(grid      )           {
+  const empties           = [];
+  for (let cell = 0; cell < 81; cell++) {
+    if (grid[cell] === 0) empties.push(cell);
+  }
+  // most-constrained first: fewest candidates
+  return empties.sort(
+    (a, b) => candidates(grid, a).length - candidates(grid, b).length,
+  );
+}
+
+function backtrack(
+  grid      ,
+  empties          ,
+  pos        ,
+  randomize         ,
+  rng              ,
+)              {
+  if (pos >= empties.length) return grid;
+  // re-sort tail for MRV every 12 assignments (cheap heuristic refresh)
+  if (pos > 0 && pos % 12 === 0) {
+    const tail = empties.slice(pos).sort(
+      (a, b) => candidates(grid, a).length - candidates(grid, b).length,
+    );
+    for (let i = 0; i < tail.length; i++) empties[pos + i] = tail[i]          ;
+  }
+  const cell = empties[pos]          ;
+  let digits = candidates(grid, cell);
+  if (randomize) digits = shuffle(digits, rng);
+  for (const digit of digits) {
+    grid[cell] = digit;
+    const result = backtrack(grid, empties, pos + 1, randomize, rng);
+    if (result) return result;
+    grid[cell] = 0;
+  }
+  return null;
+}
+
+function shuffle   (list     , rng              )      {
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = out[i]     ;
+    out[i] = out[j]     ;
+    out[j] = tmp;
+  }
+  return out;
+}
+
+/** Count solutions up to `limit` (used for uniqueness). */
+export function countSolutions(input      , limit = 2)         {
+  const grid = [...input];
+  let count = 0;
+  const walk = ()       => {
+    if (count >= limit) return;
+    let best = -1;
+    let bestCandidates           = [];
+    for (let cell = 0; cell < 81; cell++) {
+      if (grid[cell] !== 0) continue;
+      const cands = candidates(grid, cell);
+      if (cands.length === 0) return; // dead end
+      if (best === -1 || cands.length < bestCandidates.length) {
+        best = cell;
+        bestCandidates = cands;
+        if (cands.length === 1) break;
+      }
+    }
+    if (best === -1) {
+      count++; // complete
+      return;
+    }
+    for (const digit of bestCandidates) {
+      grid[best] = digit;
+      walk();
+      grid[best] = 0;
+      if (count >= limit) return;
+    }
+  };
+  walk();
+  return count;
+}
+
+/** Deterministic RNG (xorshift) for reproducible puzzles. */
+export function makeRng(seed        )               {
+  let state = seed >>> 0 || 1;
+  return () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    return state / 4294967296;
+  };
+}
+
+                         
+               
+                 
+                 
+ 
+
+                                                        
+
+const CLUE_TARGETS                                 = {
+  easy: 40,
+  medium: 32,
+  hard: 26,
+};
+
+/**
+ * Generate a puzzle: fill a full random solution, then remove clues in
+ * random order while the puzzle stays uniquely solvable, stopping at the
+ * difficulty's clue target (or when no more removals are possible).
+ */
+export function generate(difficulty                , rng               = makeRng(1))         {
+  const full = solve(new Array(81).fill(0), true, rng);
+  if (!full) throw new Error("failed to build a full grid");
+  const puzzle = [...full];
+
+  const removalOrder = shuffle(
+    Array.from({ length: 81 }, (_, i) => i),
+    rng,
+  );
+  let givens = 81;
+  const target = CLUE_TARGETS[difficulty];
+  for (const cell of removalOrder) {
+    if (givens <= target) break;
+    const backup = puzzle[cell]          ;
+    puzzle[cell] = 0;
+    if (countSolutions(puzzle, 2) === 1) {
+      givens--;
+    } else {
+      puzzle[cell] = backup;
+    }
+  }
+  return { puzzle, solution: full, givens };
+}
+
+/** Hint: reveal one cell from the solution (most constrained first). */
+export function hint(grid      , solution      )                {
+  let best = -1;
+  let bestCount = 10;
+  for (let cell = 0; cell < 81; cell++) {
+    if (grid[cell] !== 0) continue;
+    const count = candidates(grid, cell).length;
+    if (count < bestCount) {
+      best = cell;
+      bestCount = count;
+    }
+  }
+  if (best === -1) return null;
+  grid[best] = solution[best]          ;
+  return best;
+}
+
+/** Pencil notes: recompute the auto-candidates for a cell. */
+export function autoNotes(grid      , cell        )           {
+  if (grid[cell] !== 0) return [];
+  return candidates(grid, cell);
+}
+
+/** True when the grid is completely and correctly filled. */
+export function isSolved(grid      , solution       )          {
+  if (grid.some((v) => v === 0)) return false;
+  if (solution) return grid.every((v, i) => v === solution[i]);
+  for (let unit = 0; unit < 27; unit++) {
+    const seen = new Set        ();
+    for (const cell of unitCells(unit)) {
+      seen.add(grid[cell]          );
+    }
+    if (seen.size !== 9) return false;
+  }
+  return true;
+}
+
+export function unitCells(unit        )           {
+  const cells           = [];
+  if (unit < 9) {
+    const row = unit;
+    for (let c = 0; c < 9; c++) cells.push(idx(row, c));
+  } else if (unit < 18) {
+    const col = unit - 9;
+    for (let r = 0; r < 9; r++) cells.push(idx(r, col));
+  } else {
+    const box = unit - 18;
+    const boxRow = Math.floor(box / 3) * 3;
+    const boxCol = (box % 3) * 3;
+    for (let r = boxRow; r < boxRow + 3; r++) {
+      for (let c = boxCol; c < boxCol + 3; c++) {
+        cells.push(idx(r, c));
+      }
+    }
+  }
+  return cells;
+}
+
+/** Format a grid as 81-char text (0 = empty). */
+export function toLine(grid      )         {
+  return grid.join("");
+}
+
+export function fromLine(line        )       {
+  if (line.length !== 81 || /[^0-9]/.test(line)) {
+    throw new Error("grid must be 81 characters of digits");
+  }
+  return [...line].map(Number);
+}
+
+/* DOM layer: grid rendering, keyboard input, pencil notes, hint button,
+ * difficulty selector, mistake checking and print-to-PDF. */
+
+// core.ts (inlined below)
+
+const STORAGE_KEY = "sudoku-web-saved";
+
+let puzzle       = new Array(81).fill(0);
+let solution       = new Array(81).fill(0);
+let user       = new Array(81).fill(0);
+let notes                           = new Map();
+let selected = -1;
+let noteMode = false;
+let hintsUsed = 0;
+
+function newGame(difficulty                )       {
+  const rng = makeRng((Date.now() & 0x7fffffff) || 1);
+  const result         = generate(difficulty, rng);
+  puzzle = result.puzzle;
+  solution = result.solution;
+  user = [...puzzle];
+  notes = new Map();
+  hintsUsed = 0;
+  selected = -1;
+  persist();
+  paint();
+}
+
+function persist()       {
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ puzzle, solution, user, hintsUsed }),
+    );
+  } catch {
+    /* private mode: play without saving */
+  }
+}
+
+function restore()          {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const saved = JSON.parse(raw)     
+                                                                  
+     ;
+    if (!saved.puzzle || saved.puzzle.length !== 81) return false;
+    puzzle = saved.puzzle;
+    solution = saved.solution;
+    user = saved.user;
+    hintsUsed = saved.hintsUsed ?? 0;
+    notes = new Map();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildBoard()       {
+  const boardEl = document.getElementById("board")               ;
+  boardEl.innerHTML = "";
+  for (let cell = 0; cell < 81; cell++) {
+    const cellEl = document.createElement("div");
+    cellEl.className = "cell";
+    cellEl.dataset.cell = String(cell);
+    cellEl.addEventListener("click", () => {
+      selected = cell;
+      paint();
+    });
+    boardEl.appendChild(cellEl);
+    if (cell % 9 === 8 && cell % 27 !== 26) {
+      const gap = document.createElement("div");
+      gap.className = "vgap";
+      boardEl.appendChild(gap);
+    }
+    if (cell % 27 === 26 && cell !== 80) {
+      const gap = document.createElement("div");
+      gap.className = "hgap-full";
+      boardEl.appendChild(gap);
+    }
+  }
+}
+
+function paint()       {
+  const cells = document.querySelectorAll                ("#board .cell");
+  cells.forEach((cellEl) => {
+    const cell = Number(cellEl.dataset.cell);
+    const given = puzzle[cell] !== 0;
+    const value = given ? puzzle[cell] : user[cell];
+    cellEl.classList.toggle("given", given);
+    cellEl.classList.toggle("selected", cell === selected);
+    cellEl.classList.toggle(
+      "wrong",
+      !given && user[cell] !== 0 && user[cell] !== solution[cell],
+    );
+    if (value !== 0) {
+      cellEl.textContent = String(value);
+      cellEl.classList.remove("notes");
+    } else {
+      const noteSet = notes.get(cell);
+      cellEl.textContent = noteSet && noteSet.size > 0 ? [...noteSet].sort().join("") : "";
+      cellEl.classList.toggle("notes", !!noteSet && noteSet.size > 0);
+    }
+  });
+  const status = document.getElementById("status")               ;
+  const filled = user.filter((v) => v !== 0).length;
+  status.textContent =
+    `filled ${filled}/81 · hints ${hintsUsed}` +
+    (isSolved(user, solution) ? " — SOLVED ✔" : "");
+}
+
+function onDigit(digit        )       {
+  if (selected === -1 || puzzle[selected] !== 0) return;
+  if (noteMode) {
+    const noteSet = notes.get(selected) ?? new Set        ();
+    if (noteSet.has(digit)) {
+      noteSet.delete(digit);
+    } else {
+      noteSet.add(digit);
+    }
+    notes.set(selected, noteSet);
+    user[selected] = 0;
+  } else {
+    user[selected] = digit;
+    // clear the cell's notes once a real digit is placed
+    notes.delete(selected);
+    if (isSolved(user, solution)) {
+      persist();
+    }
+  }
+  persist();
+  paint();
+}
+
+function useHint()       {
+  const grid = [...puzzle];
+  for (let i = 0; i < 81; i++) {
+    if (user[i] !== 0) grid[i] = user[i];
+  }
+  const cell = hint(grid, solution);
+  if (cell === null) return;
+  hintsUsed++;
+  user[cell] = solution[cell]          ;
+  notes.delete(cell);
+  persist();
+  paint();
+}
+
+function setup()       {
+  buildBoard();
+  if (!restore()) {
+    newGame("easy");
+  }
+  paint();
+
+  document.getElementById("new-easy")?.addEventListener("click", () => newGame("easy"));
+  document.getElementById("new-medium")?.addEventListener("click", () => newGame("medium"));
+  document.getElementById("new-hard")?.addEventListener("click", () => newGame("hard"));
+  document.getElementById("hint")?.addEventListener("click", useHint);
+  document.getElementById("solve")?.addEventListener("click", () => {
+    user = [...solution];
+    persist();
+    paint();
+  });
+  document.getElementById("print")?.addEventListener("click", () => window.print());
+  document.getElementById("note-mode")?.addEventListener("click", () => {
+    noteMode = !noteMode;
+    (document.getElementById("note-mode")                     ).classList.toggle(
+      "active",
+      noteMode,
+    );
+  });
+  document.getElementById("load-line")?.addEventListener("click", () => {
+    const line = (document.getElementById("grid-line")                    ).value;
+    try {
+      puzzle = fromLine(line);
+      solution = solve(puzzle) ?? [...puzzle];
+      user = [...puzzle];
+      persist();
+      paint();
+    } catch (error) {
+      alert(String(error));
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key >= "1" && event.key <= "9") {
+      onDigit(Number(event.key));
+    } else if (event.key.toLowerCase() === "n") {
+      noteMode = !noteMode;
+      (document.getElementById("note-mode")                     ).classList.toggle(
+        "active",
+        noteMode,
+      );
+    } else if (event.key.startsWith("Arrow")) {
+      event.preventDefault();
+      if (selected === -1) selected = 40;
+      else {
+        const col = selected % 9;
+        const row = Math.floor(selected / 9);
+        if (event.key === "ArrowLeft" && col > 0) selected--;
+        if (event.key === "ArrowRight" && col < 8) selected++;
+        if (event.key === "ArrowUp" && row > 0) selected -= 9;
+        if (event.key === "ArrowDown" && row < 8) selected += 9;
+      }
+      paint();
+    }
+  });
+}
+
+if (typeof document !== "undefined" && document.getElementById("board")) {
+  setup();
+}
+
+</script>
+</body>
+</html>

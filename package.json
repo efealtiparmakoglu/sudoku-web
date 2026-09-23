@@ -1,0 +1,12 @@
+{
+  "name": "sudoku-web",
+  "version": "1.0.0",
+  "description": "Offline client-side sudoku: generator, solver, hints, pencil notes, print-to-PDF",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "test": "node --test tests/",
+    "build": "node build.ts"
+  }
+}
